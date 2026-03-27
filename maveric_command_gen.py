@@ -23,33 +23,13 @@ try:
 except ImportError:
     _PROTOCOL_OK = False
 
-# ─── Default built-in YAML ───────────────────────────────────────────────────
-DEFAULT_YAML = """\
-commands:
-  ping:
-    args: []
-
-  tlm_beacon:
-    args:
-      - name: seq
-        type: int
-      - name: unix time
-        type: epoch_ms
-      - name: status_a
-        type: int
-      - name: status_b
-        type: int
-
-  set_mode:
-    args:
-      - name: mode
-        type: str
-
-  set_voltage:
-    args:
-      - name: voltage
-        type: float
-"""
+# ─── Default YAML (loaded from maveric_commands.yml if present) ──────────────
+_COMMANDS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "maveric_commands.yml")
+if os.path.exists(_COMMANDS_FILE):
+    with open(_COMMANDS_FILE, "r") as _f:
+        DEFAULT_YAML = _f.read()
+else:
+    DEFAULT_YAML = "commands: {}\n"
 
 # ─── Constants ───────────────────────────────────────────────────────────────
 NODE_MAP = {
@@ -70,7 +50,7 @@ EPOCH_MS_MAX = 1_893_456_000_000   # ~2030
 # ─── Page config ─────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="MAVERIC Command Generator",
-    page_icon="🛰️",
+    page_icon=":satellite:",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -82,6 +62,11 @@ st.markdown("""
 
 html, body, [class*="css"] {
     font-family: 'Rajdhani', sans-serif;
+}
+
+/* Hide deploy button */
+[data-testid="stAppDeployButton"] {
+    display: none !important;
 }
 
 /* Warm off-white background */
@@ -456,6 +441,30 @@ def build_queue_entry(src, dst, echo, ptype, cmd, args_list) -> dict:
         "cmd": cmd.lower(), "args": args_str, "raw_cmd": raw_hex,
     }
 
+def _entry_to_jsonl_line(entry: dict) -> str:
+    return json.dumps([
+        NODE_MAP_INV.get(entry["src"], str(entry["src"])),
+        NODE_MAP_INV.get(entry["dest"], str(entry["dest"])),
+        NODE_MAP_INV.get(entry["echo"], str(entry["echo"])),
+        PTYPE_MAP_INV.get(entry["ptype"], str(entry["ptype"])),
+        entry["cmd"],
+        entry["args"],
+    ])
+
+def _packet_str_to_jsonl_line(packet: str) -> str:
+    parts = packet.split()
+    src, dest, echo, ptype = int(parts[0]), int(parts[1]), int(parts[2]), int(parts[3])
+    cmd  = parts[4] if len(parts) > 4 else ""
+    args = " ".join(parts[5:]) if len(parts) > 5 else ""
+    return json.dumps([
+        NODE_MAP_INV.get(src, str(src)),
+        NODE_MAP_INV.get(dest, str(dest)),
+        NODE_MAP_INV.get(echo, str(echo)),
+        PTYPE_MAP_INV.get(ptype, str(ptype)),
+        cmd,
+        args,
+    ])
+
 # ─── Session state ────────────────────────────────────────────────────────────
 if "history" not in st.session_state:
     st.session_state.history = []
@@ -468,8 +477,6 @@ if "tx_queue" not in st.session_state:
 st.markdown("""
 <div class="maveric-header">
   <div>
-    <div style="font-size:2rem; line-height:1">🛰️</div>
-  </div>
   <div>
     <h1>MAVERIC  COMMAND  GENERATOR</h1>
     <div class="subtitle"><span class="status-dot"></span>MISSION OPERATIONS · PACKET BUILDER v1.0</div>
@@ -494,7 +501,7 @@ with st.sidebar:
             st.session_state.yaml_text = raw_bytes.decode()
         st.success(f"Loaded: {uploaded.name}")
 
-    with st.expander("✏️ Edit YAML inline", expanded=False):
+    with st.expander("Edit YAML inline", expanded=False):
         new_yaml = st.text_area("", value=st.session_state.yaml_text, height=340, label_visibility="collapsed")
         if st.button("Apply YAML"):
             st.session_state.yaml_text = new_yaml
@@ -520,7 +527,7 @@ with st.sidebar:
 # ─── Main content ─────────────────────────────────────────────────────────────
 commands = load_commands(st.session_state.yaml_text)
 
-tab_build, tab_raw, tab_queue, tab_history = st.tabs(["⚡  BUILD PACKET", "📡  RAW INPUT PARSER", "📤  TX QUEUE", "📋  HISTORY"])
+tab_build, tab_raw, tab_queue, tab_history = st.tabs(["BUILD PACKET", "RAW INPUT PARSER", "TX QUEUE", "HISTORY"])
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 1 — GUI BUILDER
@@ -577,9 +584,9 @@ with tab_build:
                                 val = st.text_input(f"{aname} (epoch_ms)", value=default_epoch, key=f"arg_{i}")
                             ok, info = validate_epoch_ms(val)
                             if ok:
-                                epoch_warnings.append(f"✓ {aname}: {info}")
+                                epoch_warnings.append(f"OK {aname}: {info}")
                             else:
-                                epoch_warnings.append(f"✗ {aname}: {info}")
+                                epoch_warnings.append(f"ERROR {aname}: {info}")
                         elif atype == "bool":
                             bool_val = st.selectbox(f"{aname}", ["true", "false", "1", "0"], key=f"arg_{i}")
                             val = bool_val
@@ -594,7 +601,7 @@ with tab_build:
                     arg_values.extend(extra.strip().split())
 
             for ew in epoch_warnings:
-                if ew.startswith("✓"):
+                if ew.startswith("OK"):
                     st.success(ew)
                 else:
                     st.error(ew)
@@ -621,19 +628,19 @@ with tab_build:
 
     with copy_col:
         st.markdown('<div style="margin-top:24px">', unsafe_allow_html=True)
-        if st.button("➕ Add to Queue", key="add_queue"):
+        if st.button("Add to Queue", key="add_queue"):
             entry = build_queue_entry(src_int, dst_int, echo_int, ptype_int,
                                       cmd_sel if commands else "NONE", arg_values)
             st.session_state.tx_queue.append(entry)
             st.success(f"Queued ({len(st.session_state.tx_queue)})")
-        if st.button("📋 Save to History", key="save_hist"):
+        if st.button("Save to History", key="save_hist"):
             ts = datetime.now().strftime("%H:%M:%S")
             st.session_state.history.append({"ts": ts, "packet": packet_str})
             st.success("Saved!")
         st.markdown('</div>', unsafe_allow_html=True)
 
     # Breakdown table
-    with st.expander("🔍 Packet Field Breakdown"):
+    with st.expander("Packet Field Breakdown"):
         fields = {
             "SRC (orgn)":  f"{src_int} = {src_sel}",
             "DST (dest)":  f"{dst_int} = {dst_sel}",
@@ -697,16 +704,16 @@ with tab_raw:
 
                 rcol1, rcol2 = st.columns([3, 1])
                 with rcol2:
-                    if st.button("➕ Add to Queue", key="raw_add_queue"):
+                    if st.button("Add to Queue", key="raw_add_queue"):
                         entry = build_queue_entry(src_p, dst_p, echo_p, ptype_p, cmd_p, args_p)
                         st.session_state.tx_queue.append(entry)
                         st.success(f"Queued ({len(st.session_state.tx_queue)})")
-                    if st.button("📋 Save to History", key="raw_save"):
+                    if st.button("Save to History", key="raw_save"):
                         ts = datetime.now().strftime("%H:%M:%S")
                         st.session_state.history.append({"ts": ts, "packet": packet_str_r})
                         st.success("Saved!")
 
-                with st.expander("🔍 Resolved Fields"):
+                with st.expander("Resolved Fields"):
                     rf = {
                         "SRC":   f"{src_p} ({src_name})",
                         "DST":   f"{dst_p} ({dst_name})",
@@ -724,7 +731,7 @@ with tab_raw:
                 cmd_def_r  = commands.get(cmd_p, {})
                 arg_defs_r = cmd_def_r.get("args", [])
                 if arg_defs_r:
-                    with st.expander("🧪 Argument Validation"):
+                    with st.expander("Argument Validation"):
                         for i, adef in enumerate(arg_defs_r):
                             aname = adef.get("name", f"arg{i}")
                             atype = adef.get("type", "str")
@@ -747,13 +754,13 @@ with tab_raw:
                                 except:
                                     valid = False
 
-                                icon = "✅" if valid else "❌"
+                                icon = "[OK]" if valid else "[FAIL]"
                                 msg  = f"{icon} **{aname}** `{raw_val}` → `{atype}`"
                                 if note:
                                     msg += f"  _{note}_"
                                 st.markdown(msg)
                             else:
-                                st.markdown(f"⚠️ **{aname}** → missing")
+                                st.markdown(f"[!] **{aname}** → missing")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 3 — TX QUEUE
@@ -768,12 +775,12 @@ with tab_queue:
             unsafe_allow_html=True,
         )
     with qcol2:
-        if q and st.button("🗑️ Clear All", key="q_clear"):
+        if q and st.button("Clear All", key="q_clear"):
             st.session_state.tx_queue = []
             st.rerun()
 
     if not q:
-        st.info("Queue is empty. Use '➕ Add to Queue' in the Build or Raw Input tabs.")
+        st.info("Queue is empty. Use 'Add to Queue' in the Build or Raw Input tabs.")
     else:
         for i, entry in enumerate(q):
             src_name_q   = NODE_MAP_INV.get(entry["src"],   str(entry["src"]))
@@ -803,7 +810,7 @@ with tab_queue:
                     q[i + 1], q[i] = q[i], q[i + 1]
                     st.rerun()
             with qr4:
-                if st.button("🗑️", key=f"q_del_{i}", help="Remove"):
+                if st.button("X", key=f"q_del_{i}", help="Remove"):
                     st.session_state.tx_queue.pop(i)
                     st.rerun()
 
@@ -814,29 +821,21 @@ with tab_queue:
         st.warning("mav_gss_lib not importable — raw_cmd fields will be empty. Ensure MAVERIC_GSS/ is present.")
 
     if q:
-        queue_lines = [
-            build_packet_string(
-                e["src"], e["dest"], e["echo"], e["ptype"],
-                e["cmd"], e["args"].split() if e["args"] else [],
-            )
-            for e in q
-        ]
-        export_data = "\n".join(queue_lines) + "\n"
+        export_data = "\n".join(_entry_to_jsonl_line(e) for e in q) + "\n"
 
-        _default_queue_path = os.path.join(_GSS_PATH, "logs", ".pending_queue.txt")
+        _default_queue_path = os.path.join(_GSS_PATH, "logs", ".pending_queue.jsonl")
 
         ec1, ec2 = st.columns(2)
         with ec1:
             st.download_button(
-                "⬇️ Download pending_queue.txt",
+                "Download pending_queue.jsonl",
                 data=export_data,
-                file_name="pending_queue.txt",
-                mime="text/plain",
-                help="Download plain-text queue file readable by MAV_TX2",
+                file_name="pending_queue.jsonl",
+                mime="application/jsonl",
             )
         with ec2:
             queue_path = st.text_input("Write directly to queue file", value=_default_queue_path, key="queue_path")
-            if st.button("📤 Write to queue file", key="write_queue"):
+            if st.button("Write to queue file", key="write_queue"):
                 try:
                     os.makedirs(os.path.dirname(os.path.abspath(queue_path)), exist_ok=True)
                     with open(queue_path, "w") as _qf:
@@ -857,7 +856,7 @@ with tab_history:
     else:
         hcol1, hcol2 = st.columns([5, 1])
         with hcol2:
-            if st.button("🗑️ Clear All"):
+            if st.button("Clear All"):
                 st.session_state.history = []
                 st.rerun()
 
@@ -873,23 +872,19 @@ with tab_history:
                     unsafe_allow_html=True
                 )
             with hc2:
-                if st.button("🗑️", key=f"del_{idx}"):
+                if st.button("X", key=f"del_{idx}"):
                     st.session_state.history.pop(idx)
                     st.rerun()
 
         st.markdown("---")
         st.markdown('<div class="section-label">Export</div>', unsafe_allow_html=True)
-        export_text = "\n".join(e["packet"] for e in st.session_state.history)
+        export_jsonl = "\n".join(
+            _packet_str_to_jsonl_line(e["packet"])
+            for e in st.session_state.history
+        ) + "\n"
         st.download_button(
-            "⬇️ Download as .txt",
-            data=export_text,
-            file_name=f"maveric_commands_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
-            mime="text/plain",
-        )
-        export_json = json.dumps(st.session_state.history, indent=2)
-        st.download_button(
-            "⬇️ Download as .json",
-            data=export_json,
-            file_name=f"maveric_commands_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
-            mime="application/json",
+            "Download as .jsonl",
+            data=export_jsonl,
+            file_name=f"maveric_commands_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jsonl",
+            mime="application/jsonl",
         )
